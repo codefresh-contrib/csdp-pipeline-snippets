@@ -1,0 +1,71 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cd-and-promote
+spec:
+  entrypoint: deploy-and-promote
+  templates:
+    - name: deploy-and-promote
+      inputs:
+        parameters:
+          # i.e. express-stage
+          - name: ARGOCD_APP
+          - name: ARGOCD_SERVER
+            default: argocd-server
+          # we will grab this from the commit message
+          - name: IMAGE
+          # If we want to parse images to promote instead use PROMOTE_FROM and read the images list in its kustomization
+          #- name: PROMOTE_FROM
+          #  default: stage
+          - name: PROMOTE_TO
+            default: 'nil'
+          # could get this from argocd/${PROMOTE_FROM}/app.<app_name>.yaml
+          - name: APP_PATH_PREFIX
+            default: 'kustomize/express/overlays'
+
+      dag:
+        tasks:
+          # Begin deploying
+          - name: argocd-sync
+            templateRef:
+              name: argo-hub.argocd.0.0.1
+              template: sync
+            arguments:
+              parameters:
+              - name: app
+                value: "{{inputs.parameters.ARGOCD_APP}}"
+              - name: serverUrl
+                value: "{{inputs.parameters.ARGOCD_SERVER}}"
+              - name: flags
+                value: "--insecure --plaintext"
+
+          - name: test-deployment
+            template: test
+            depends: argocd-sync
+
+          # Update deploy repo to promote deployment to next environment
+          - name: promoteImage
+            templateRef:
+              name: kustomize-promote-image
+              template: kustomize-promote-image
+            arguments:
+              parameters:
+                - name: IMAGE
+                  value: '{{ inputs.parameters.IMAGE }}'
+                - name: PROMOTE_TO
+                  value: '{{ inputs.parameters.PROMOTE_TO }}'
+                - name: APP_PATH_PREFIX
+                  value: '{{ inputs.parameters.APP_PATH_PREFIX }}'
+                - name: WRITE_REPO
+                  value: 'https://github.com/your/repo.git'
+                - name: REVISION
+                  default: 'main'
+            depends: test-deployment
+            when: "{{ inputs.parameters.PROMOTE_TO }} != 'nil'"
+    # Test template
+    - name: test
+      serviceAccountName: image-tester
+      container:
+        image: 'alpine'
+        command: [sh, -c]
+        args: ["ls"]
