@@ -1,0 +1,173 @@
+# Combined version of so only one file needs to be referenced
+# - https://github.com/codefresh-contrib/csdp-pipeline-snippets/blob/master/pipelines/cd-and-promote.workflow-template.yaml
+# - https://github.com/codefresh-contrib/csdp-pipeline-snippets/blob/master/pipelines/kustomize-promote-image.workflow-template.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: deploy-and-promote
+spec:
+  entrypoint: deploy-and-promote
+  templates:
+    - name: deploy-and-promote
+      inputs:
+        parameters:
+          # i.e. express-stage
+          - name: ARGOCD_APP
+          - name: ARGOCD_SERVER
+            default: argocd-server
+          # we will grab this from the commit message
+          - name: IMAGE
+          # If we want to parse images to promote instead use PROMOTE_FROM and read the images list in its kustomization
+          #- name: PROMOTE_FROM
+          #  default: stage
+          - name: PROMOTE_TO
+            default: 'nil'
+          # could get this from argocd/${PROMOTE_FROM}/app.<app_name>.yaml
+          - name: APP_PATH_PREFIX
+            default: 'kustomize/express/overlays'
+
+      dag:
+        tasks:
+          # Begin deploying
+          - name: argocd-sync
+            templateRef:
+              name: argo-hub.argocd.0.0.1
+              template: sync
+            arguments:
+              parameters:
+              - name: app
+                value: "{{inputs.parameters.ARGOCD_APP}}"
+              - name: serverUrl
+                value: "{{inputs.parameters.ARGOCD_SERVER}}"
+              - name: flags
+                value: "--insecure --plaintext"
+
+          - name: test-deployment
+            template: test
+            depends: argocd-sync
+
+          # Update deploy repo to promote deployment to next environment
+          - name: promoteImage
+            templateRef:
+              template: kustomize-promote-image
+            arguments:
+              parameters:
+                - name: IMAGE
+                  value: '{{ inputs.parameters.IMAGE }}'
+                - name: PROMOTE_TO
+                  value: '{{ inputs.parameters.PROMOTE_TO }}'
+                - name: APP_PATH_PREFIX
+                  value: '{{ inputs.parameters.APP_PATH_PREFIX }}'
+                - name: WRITE_REPO
+                  value: 'https://github.com/your/repo.git'
+                - name: REVISION
+                  default: 'main'
+            depends: test-deployment
+            when: "{{ inputs.parameters.PROMOTE_TO }} != 'nil'"
+
+    # Promotion workflow
+    - name: kustomize-promote-image
+      inputs:
+        parameters:
+          # we will grab this from the commit message
+          - name: IMAGE
+          # If we want to parse images to promote instead use PROMOTE_FROM and read the images list in its kustomization
+          #- name: PROMOTE_FROM
+          #  default: stage
+          - name: PROMOTE_TO
+          - name: WRITE_REPO
+            default: 'https://github.com/codefresh-contrib/csdp-salesdemo_applications.git'
+          # could get this from argocd/${PROMOTE_FROM}/app.<app_name>.yaml
+          - name: APP_PATH_PREFIX
+            default: 'kustomize/express/overlays'
+          - name: GIT_USER_NAME
+            default: 'cf-sa-demo'
+          - name: GIT_USER_EMAIL
+            default: 'salesdemosa@codefresh.io'
+          - name: REVISION
+            default: 'main'
+          - name: GIT_TOKEN_SECRET
+            default: 'github-token'
+      dag:
+        tasks:
+          # Update deploy repo, promote deployment to next environment
+          # --------------------
+          - name: clone-deploy-repo
+            templateRef:
+              name: argo-hub.git.0.0.2
+              template: clone
+            arguments:
+              parameters:
+                - name: REPO_URL
+                  value: '{{ inputs.parameters.WRITE_REPO }}'
+                - name: REVISION
+                  value: '{{ inputs.parameters.REVISION }}'
+                - name: GIT_TOKEN_SECRET
+                  value: '{{ inputs.parameters.GIT_TOKEN_SECRET }}'
+
+          - name: promote-image
+            template: kustomize-update-image
+            arguments:
+              parameters:
+                - name: IMAGE
+                  value: '{{ inputs.parameters.IMAGE }}'
+                - name: PROMOTE_TO
+                  value: '{{ inputs.parameters.PROMOTE_TO }}'
+                - name: APP_PATH_PREFIX
+                  value: '{{ inputs.parameters.APP_PATH_PREFIX }}'
+              artifacts:
+                - name: repo
+                  from: "{{ tasks.clone-deploy-repo.outputs.artifacts.repo }}"
+            depends: clone-deploy-repo
+
+          - name: commit-push-step
+            templateRef:
+              name: argo-hub.git.0.0.2
+              template: commit
+            arguments:
+              parameters:
+                - name: MESSAGE
+                  value: 'Promote {{ inputs.parameters.PROMOTE_TO }} to {{ inputs.parameters.IMAGE }}'
+                - name: GIT_USER_NAME
+                  value: '{{ inputs.parameters.GIT_USER_NAME }}'
+                - name: GIT_USER_EMAIL
+                  value: '{{ inputs.parameters.GIT_USER_EMAIL }}'
+              artifacts:
+                - name: repo
+                  from: "{{ tasks.promote-image.outputs.artifacts.repo  }}"
+            depends: promote-image
+
+    # Update image in repo using kustomize
+    - name: kustomize-update-image
+      serviceAccountName: argo-hub.git.0.0.2
+      inputs:
+        artifacts:
+          - name: repo
+            path: /tmp/repo
+        parameters:
+          - name: APP_PATH_PREFIX
+          - name: PROMOTE_TO
+          - name: IMAGE
+      outputs:
+        artifacts:
+          - name: repo
+            path: /tmp/repo
+            s3:
+              key: /{{ workflow.name }}/changed
+      script:
+        image: k8s.gcr.io/kustomize/kustomize:v3.8.7
+        command: [ sh ]
+        source: |
+          DIRPATH='{{ inputs.artifacts.repo.path }}/{{ inputs.parameters.APP_PATH_PREFIX }}/{{ inputs.parameters.PROMOTE_TO }}'
+          cd $DIRPATH
+          CHANGE="/app/kustomize edit set image {{ inputs.parameters.IMAGE }}"
+          echo $CHANGE
+          eval $CHANGE
+    # Test template
+    - name: test
+      serviceAccountName: image-tester
+      container:
+        image: 'alpine'
+        command: [sh, -c]
+        args: ["ls"]
+        
